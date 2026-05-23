@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
 """
 ser2mp4v5.py – SER RAW16 RGGB → MP4, v5
-  • Phase-Correlation-Interpolation → butterweiche Mondbewegung
-  • Timestamp-basiertes Frame-Mapping (keine Auto-Exposure-Beschleunigung)
-  • Globaler Stretch (kein Per-Frame-Flicker)
-  • Echter schwarzer Hintergrund (Maske aus Rohdaten)
-  • CLAHE für lokalen Kraterkontrast
-  • Feineres USM (sigma=1.5)
-  • 48 fps, 2 s Fade-in / Fade-out
-Usage: python3 ser2mp4v5.py <datei.ser> <ausgabe.mp4>
+
+Usage:
+  ser2mp4v5.py input.ser output.mp4 [--fps_out=48] [--color=gold]
+  ser2mp4v5.py input.ser output.mp4 --sample_time=3s --sample_from=middle
 """
 
 import sys
 import os
 import struct
 import subprocess
+import argparse
 import numpy as np
 import cv2
 
-# ── Konfiguration ─────────────────────────────────────────────────────────────
+# ── Farbpaletten (BGR-Multiplikatoren) ────────────────────────────────────────
+COLOR_PRESETS = {
+    'pale':    (0.92, 1.02, 1.02),   # fast neutral, minimalster Hauch warm
+    'gold':    (0.65, 1.10, 1.08),   # gelb-golden, subtil
+    'marsian': (0.42, 0.98, 1.22),   # orange-rot, klar sichtbar
+}
+
+# ── Konstante Konfiguration ───────────────────────────────────────────────────
 QP            = 20
 FLIP_VERT     = True
 WB_R          = 1.05
@@ -34,16 +38,50 @@ SHARP_SIGMA   = 1.5
 SKY_T_LO      = 0.10
 SKY_T_HI      = 0.22
 SKY_BLUR_SIG  = 15
-FPS_OUT       = 48
 FADE_SECS     = 2.0
 SAMPLE_STEP   = 20
-ALPHA_MIN     = 0.02   # unter diesem Wert kein Interpolieren nötig
-# Color-Grading: gelb-golden (G leicht hoch, B runter, R kaum anfassen)
-GRADE_B       = 0.65
-GRADE_G       = 1.10
-GRADE_R       = 1.08
+ALPHA_MIN     = 0.02
 VAAPI_DEV     = '/dev/dri/renderD128'
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description='SER RAW16 RGGB → MP4 Mondvideo-Pipeline',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Beispiele:
+  %(prog)s capture.ser output.mp4
+  %(prog)s capture.ser output.mp4 --fps_out=60 --color=marsian
+  %(prog)s capture.ser output.mp4 --sample_time=3s --sample_from=middle
+        """,
+    )
+    p.add_argument('ser_file', help='Eingabe: .ser Datei')
+    p.add_argument('output',   help='Ausgabe: .mp4 Datei')
+    p.add_argument('--fps_out', type=int, default=48,
+                   metavar='N', help='Ausgabe-Framerate (Standard: 48)')
+    p.add_argument('--color', choices=list(COLOR_PRESETS), default='gold',
+                   help='Farbpalette: pale, gold, marsian (Standard: gold)')
+    p.add_argument('--sample_time', default=None,
+                   metavar='DAUER', help='Vorschau-Dauer, z.B. 3s oder 500ms')
+    p.add_argument('--sample_from', choices=['start', 'middle', 'end'],
+                   default='middle', help='Vorschau-Position (Standard: middle)')
+    return p.parse_args()
+
+
+def parse_duration(s):
+    """'3s' → 3.0,  '500ms' → 0.5"""
+    s = s.strip().lower()
+    if s.endswith('ms'):
+        return float(s[:-2]) / 1000.0
+    if s.endswith('s'):
+        return float(s[:-1])
+    return float(s)
+
+
+def sample_output_path(output):
+    base, ext = os.path.splitext(output)
+    return f"{base}_sample{ext}"
 
 
 def parse_ser_header(f):
@@ -76,16 +114,12 @@ def read_timestamps(f, info):
 
 
 def build_interpolation_map(ts, n_out):
-    """
-    Für jeden Output-Frame: (i_lo, i_hi, alpha).
-    alpha=0 → Frame i_lo, alpha=1 → Frame i_hi.
-    """
     targets = (ts[0] + np.arange(n_out, dtype=np.float64)
                / max(n_out - 1, 1) * float(ts[-1] - ts[0]))
     i_lo = (np.searchsorted(ts.astype(np.float64), targets, side='right') - 1
             ).clip(0, len(ts) - 2)
     i_hi = (i_lo + 1).clip(0, len(ts) - 1)
-    span = (ts[i_hi].astype(np.float64) - ts[i_lo].astype(np.float64))
+    span = ts[i_hi].astype(np.float64) - ts[i_lo].astype(np.float64)
     alpha = np.where(span > 0,
                      (targets - ts[i_lo].astype(np.float64)) / (span + 1e-9),
                      0.0).clip(0, 1)
@@ -124,7 +158,9 @@ def calibrate_stretch(f, info):
     return lo, hi
 
 
-def process_frame(arr, bayer_code, lo, hi):
+def process_frame(arr, bayer_code, lo, hi, grade):
+    grade_b, grade_g, grade_r = grade
+
     bgr_f = debayer_wb(arr, bayer_code)
     bgr_n = np.clip((bgr_f - lo) / (hi - lo + 1e-6), 0, 1)
 
@@ -149,12 +185,11 @@ def process_frame(arr, bayer_code, lo, hi):
 
     bgr8 = (bgr8.astype(np.float32) * sky_mask[:, :, np.newaxis]).clip(0, 255).astype(np.uint8)
 
-    # Color-Grading: gelb-golden
-    f = bgr8.astype(np.float32)
-    f[:, :, 0] = np.clip(f[:, :, 0] * GRADE_B, 0, 255)
-    f[:, :, 1] = np.clip(f[:, :, 1] * GRADE_G, 0, 255)
-    f[:, :, 2] = np.clip(f[:, :, 2] * GRADE_R, 0, 255)
-    bgr8 = f.astype(np.uint8)
+    g = bgr8.astype(np.float32)
+    g[:, :, 0] = np.clip(g[:, :, 0] * grade_b, 0, 255)
+    g[:, :, 1] = np.clip(g[:, :, 1] * grade_g, 0, 255)
+    g[:, :, 2] = np.clip(g[:, :, 2] * grade_r, 0, 255)
+    bgr8 = g.astype(np.uint8)
 
     if FLIP_VERT:
         bgr8 = cv2.flip(bgr8, 0)
@@ -162,11 +197,6 @@ def process_frame(arr, bayer_code, lo, hi):
 
 
 def interpolate_frames(frame_a, frame_b, alpha, warp_maps_cache, pair_key):
-    """
-    Phase-Correlation-Interpolation: berechnet Translationsvektor per FFT,
-    warpt beide Frames auf die Zwischenposition, blendet.
-    Warp-Maps werden pro Frame-Paar gecacht.
-    """
     if pair_key not in warp_maps_cache:
         ga = cv2.cvtColor(frame_a, cv2.COLOR_BGR2GRAY).astype(np.float32)
         gb = cv2.cvtColor(frame_b, cv2.COLOR_BGR2GRAY).astype(np.float32)
@@ -175,10 +205,8 @@ def interpolate_frames(frame_a, frame_b, alpha, warp_maps_cache, pair_key):
         cx = np.tile(np.arange(w, dtype=np.float32), (h, 1))
         cy = np.tile(np.arange(h, dtype=np.float32).reshape(h, 1), (1, w))
         warp_maps_cache[pair_key] = (dx, dy, cx, cy)
-        # Cache-Größe begrenzen
         if len(warp_maps_cache) > 4:
-            oldest = next(iter(warp_maps_cache))
-            del warp_maps_cache[oldest]
+            del warp_maps_cache[next(iter(warp_maps_cache))]
 
     dx, dy, cx, cy = warp_maps_cache[pair_key]
 
@@ -195,14 +223,14 @@ def interpolate_frames(frame_a, frame_b, alpha, warp_maps_cache, pair_key):
     return cv2.addWeighted(warped_a, 1.0 - alpha, warped_b, alpha, 0)
 
 
-def build_ffmpeg_cmd(info, output):
+def build_ffmpeg_cmd(info, output, fps_out):
     use_vaapi = os.path.exists(VAAPI_DEV)
     base = [
         'ffmpeg', '-y',
         '-f', 'rawvideo',
         '-pixel_format', 'bgr24',
         '-video_size', f'{info["width"]}x{info["height"]}',
-        '-framerate', str(FPS_OUT),
+        '-framerate', str(fps_out),
         '-i', 'pipe:0',
     ]
     if use_vaapi:
@@ -216,15 +244,60 @@ def build_ffmpeg_cmd(info, output):
     return base + enc + ['-movflags', '+faststart', output]
 
 
+def render(f, info, i_lo_arr, i_hi_arr, alpha_arr, out_indices,
+           output, fps_out, lo, hi, grade, fade):
+    cmd  = build_ffmpeg_cmd(info, output, fps_out)
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+
+    total       = len(out_indices)
+    fade_frames = int(fps_out * FADE_SECS) if fade else 0
+    frame_cache = {}
+    warp_cache  = {}
+
+    for seq_i, out_i in enumerate(out_indices):
+        i_lo  = int(i_lo_arr[out_i])
+        i_hi  = int(i_hi_arr[out_i])
+        alpha = float(alpha_arr[out_i])
+
+        if i_lo not in frame_cache:
+            arr = read_frame(f, info, i_lo)
+            frame_cache[i_lo] = process_frame(arr, info['bayer_code'], lo, hi, grade)
+        frame_lo = frame_cache[i_lo]
+
+        if alpha < ALPHA_MIN or i_lo == i_hi:
+            bgr8 = frame_lo
+        else:
+            if i_hi not in frame_cache:
+                arr = read_frame(f, info, i_hi)
+                frame_cache[i_hi] = process_frame(arr, info['bayer_code'], lo, hi, grade)
+            frame_hi = frame_cache[i_hi]
+            bgr8 = interpolate_frames(frame_lo, frame_hi, alpha,
+                                      warp_cache, (i_lo, i_hi))
+
+        if fade_frames:
+            if seq_i < fade_frames:
+                bgr8 = (bgr8 * (seq_i / fade_frames)).astype(np.uint8)
+            elif seq_i >= total - fade_frames:
+                bgr8 = (bgr8 * ((total - 1 - seq_i) / fade_frames)).astype(np.uint8)
+
+        proc.stdin.write(bgr8.tobytes())
+
+        for k in list(frame_cache):
+            if k < i_lo - 1:
+                del frame_cache[k]
+
+        if (seq_i + 1) % 100 == 0 or seq_i == 0:
+            print(f"  Frame {seq_i+1}/{total} ({(seq_i+1)/total*100:.0f}%)...", flush=True)
+
+    proc.stdin.close()
+    return proc.wait()
+
+
 def main():
-    if len(sys.argv) != 3:
-        print(f"Usage: {sys.argv[0]} <datei.ser> <ausgabe.mp4>")
-        sys.exit(1)
+    args  = parse_args()
+    grade = COLOR_PRESETS[args.color]
 
-    ser_path = sys.argv[1]
-    output   = sys.argv[2]
-
-    with open(ser_path, 'rb') as f:
+    with open(args.ser_file, 'rb') as f:
         info = parse_ser_header(f)
 
         if info['bayer_code'] is None:
@@ -232,74 +305,48 @@ def main():
             sys.exit(1)
 
         print(f"SER: {info['width']}x{info['height']} {info['bit_depth']}bit "
-              f"| {info['frame_count']} Frames | → {output}")
+              f"| {info['frame_count']} Frames | → {args.output}")
+        print(f"Optionen: fps_out={args.fps_out}  color={args.color} "
+              f"[B×{grade[0]}  G×{grade[1]}  R×{grade[2]}]")
 
         ts = read_timestamps(f, info)
+        n  = info['frame_count']
         if ts is not None:
             duration_s = (ts[-1] - ts[0]) / 1e7
             print(f"Timestamps: {duration_s:.1f} s Echtzeit")
-            i_lo_arr, i_hi_arr, alpha_arr = build_interpolation_map(ts, info['frame_count'])
+            i_lo_arr, i_hi_arr, alpha_arr = build_interpolation_map(ts, n)
         else:
             print("Keine Timestamps — lineare Reihenfolge, keine Interpolation.")
-            n = info['frame_count']
-            i_lo_arr = np.arange(n, dtype=np.int32)
-            i_hi_arr = np.arange(n, dtype=np.int32)
+            i_lo_arr  = np.arange(n, dtype=np.int32)
+            i_hi_arr  = np.arange(n, dtype=np.int32)
             alpha_arr = np.zeros(n)
 
         lo, hi = calibrate_stretch(f, info)
 
-        cmd  = build_ffmpeg_cmd(info, output)
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-
-        total       = info['frame_count']
-        fade_frames = int(FPS_OUT * FADE_SECS)
-        frame_cache = {}   # src_idx → processed frame
-        warp_cache  = {}   # (i_lo, i_hi) → (dx, dy, cx, cy)
-
-        for out_i in range(total):
-            i_lo  = int(i_lo_arr[out_i])
-            i_hi  = int(i_hi_arr[out_i])
-            alpha = float(alpha_arr[out_i])
-
-            # Frames aus Cache oder frisch rendern
-            if i_lo not in frame_cache:
-                arr = read_frame(f, info, i_lo)
-                frame_cache[i_lo] = process_frame(arr, info['bayer_code'], lo, hi)
-            frame_lo = frame_cache[i_lo]
-
-            if alpha < ALPHA_MIN or i_lo == i_hi:
-                bgr8 = frame_lo
-            else:
-                if i_hi not in frame_cache:
-                    arr = read_frame(f, info, i_hi)
-                    frame_cache[i_hi] = process_frame(arr, info['bayer_code'], lo, hi)
-                frame_hi = frame_cache[i_hi]
-                bgr8 = interpolate_frames(frame_lo, frame_hi, alpha,
-                                          warp_cache, (i_lo, i_hi))
-
-            # Fade-in / Fade-out
-            if out_i < fade_frames:
-                bgr8 = (bgr8 * (out_i / fade_frames)).astype(np.uint8)
-            elif out_i >= total - fade_frames:
-                bgr8 = (bgr8 * ((total - 1 - out_i) / fade_frames)).astype(np.uint8)
-
-            proc.stdin.write(bgr8.tobytes())
-
-            # Cache-Größe begrenzen (letzte 3 Frames reichen)
-            for k in list(frame_cache):
-                if k < i_lo - 1:
-                    del frame_cache[k]
-
-            if (out_i + 1) % 100 == 0 or out_i == 0:
-                pct = (out_i + 1) / total * 100
-                print(f"  Frame {out_i+1}/{total} ({pct:.0f}%)...", flush=True)
-
-        proc.stdin.close()
-        ret = proc.wait()
+        if args.sample_time:
+            sample_s      = parse_duration(args.sample_time)
+            sample_frames = max(1, int(sample_s * args.fps_out))
+            if args.sample_from == 'start':
+                start = 0
+            elif args.sample_from == 'end':
+                start = max(0, n - sample_frames)
+            else:  # middle
+                start = max(0, (n - sample_frames) // 2)
+            out_indices = list(range(start, min(n, start + sample_frames)))
+            out_path    = sample_output_path(args.output)
+            print(f"Vorschau: {len(out_indices)} Frames ab Index {start} "
+                  f"(≈{len(out_indices)/args.fps_out:.1f} s) → {out_path}")
+            ret = render(f, info, i_lo_arr, i_hi_arr, alpha_arr,
+                         out_indices, out_path, args.fps_out, lo, hi, grade, fade=False)
+        else:
+            out_path    = args.output
+            out_indices = list(range(n))
+            ret = render(f, info, i_lo_arr, i_hi_arr, alpha_arr,
+                         out_indices, out_path, args.fps_out, lo, hi, grade, fade=True)
 
     if ret == 0:
-        size_mb = os.path.getsize(output) / 1024**2
-        print(f"\nFertig: {output} ({size_mb:.1f} MB)")
+        size_mb = os.path.getsize(out_path) / 1024**2
+        print(f"\nFertig: {out_path} ({size_mb:.1f} MB)")
     else:
         print(f"\nFFmpeg-Fehler (Code {ret})", file=sys.stderr)
         sys.exit(1)
