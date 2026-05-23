@@ -157,6 +157,30 @@ def sharpness(bgr_f):
     return float(cv2.Laplacian(gray, cv2.CV_32F).var())
 
 
+def wavelet_sharpen(img_f, levels=((1, 0.5), (2, 1.8), (4, 1.2), (8, 0.6))):
+    """
+    Laplacian-Pyramiden-Sharpening (RegiStax-Prinzip).
+    Jede Ebene = Differenz zweier Gaußblurs → Detailschicht einer Raumfrequenz.
+    Amplifikation: sigma=1 (Rauschen) niedrig, sigma=2-4 (Bänder) hoch.
+    """
+    result = img_f.copy().astype(np.float32)
+    prev   = result.copy()
+    for sigma, amount in levels:
+        smooth  = cv2.GaussianBlur(prev, (0, 0), sigma)
+        detail  = prev - smooth
+        result += detail * amount
+        prev    = smooth
+    return result
+
+
+def enhance_contrast(bgr_uint8):
+    """CLAHE auf LAB-L-Kanal für lokalen Kontrast."""
+    lab   = cv2.cvtColor(bgr_uint8, cv2.COLOR_BGR2LAB)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+    lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+
 # ══ Stacking ══════════════════════════════════════════════════════════════════
 
 def main():
@@ -251,21 +275,46 @@ def main():
             print("Fehler: Keine Frames gestackt.", file=sys.stderr)
             sys.exit(1)
 
+        discarded = n_stack - stacked
+        print(f"\n{stacked} Frames gestackt"
+              + (f" ({discarded} wegen Shift-Fehler verworfen)" if discarded else "") + ".")
+
+        # ── Wavelet-Sharpening ────────────────────────────────────────────────
         result_f = acc / w_total
-        print(f"\n{stacked} Frames gestackt (davon {n_stack - stacked} wegen"
-              f" Shift-Fehler verworfen)") if stacked < n_stack else \
-            print(f"\n{stacked} Frames gestackt.")
+        result_f = wavelet_sharpen(result_f)
 
-        # ── Stretch auf 16-bit ────────────────────────────────────────────────
-        lo = np.percentile(result_f, 0.1)
-        hi = np.percentile(result_f, 99.9)
-        result16 = np.clip(
-            (result_f - lo) / (hi - lo + 1e-9) * 65535, 0, 65535
-        ).astype(np.uint16)
+        # ── Stretch + Kontrast ────────────────────────────────────────────────
+        lo = np.percentile(result_f, 0.05)
+        hi = np.percentile(result_f, 99.95)
+        result8 = np.clip(
+            (result_f - lo) / (hi - lo + 1e-9) * 255, 0, 255
+        ).astype(np.uint8)
+        result8 = enhance_contrast(result8)
 
+        # ── 16-bit speichern ──────────────────────────────────────────────────
+        result16 = result8.astype(np.uint16) * 257  # 8-bit → 16-bit
         cv2.imwrite(args.output, result16)
         size_kb = os.path.getsize(args.output) / 1024
-        print(f"Fertig: {args.output} ({size_kb:.0f} KB, 16-bit)")
+        print(f"Stack: {args.output} ({size_kb:.0f} KB, 16-bit)")
+
+        # ── Kontext-Bild: besten Frame in größerem Ausschnitt ─────────────────
+        # Zeigt Jupiter + Monde im Umfeld (kein Stacking, kein Sharpening)
+        ctx_bgr = debayer(reader.read_frame(best_idx), bc)
+        ctx_cx, ctx_cy = int(centers[best_idx][0]), int(centers[best_idx][1])
+        ctx_size = args.crop * 3
+        h, w = ctx_bgr.shape[:2]
+        half = ctx_size // 2
+        ctx_cx = int(np.clip(ctx_cx, half, w - half))
+        ctx_cy = int(np.clip(ctx_cy, half, h - half))
+        ctx_crop = crop_around(ctx_bgr, ctx_cx, ctx_cy, ctx_size)
+
+        lo2 = np.percentile(ctx_crop, 99.0)
+        hi2 = np.percentile(ctx_crop, 99.98)
+        ctx8 = np.clip((ctx_crop - lo2) / (hi2 - lo2 + 1e-9) * 255, 0, 255).astype(np.uint8)
+
+        ctx_path = os.path.splitext(args.output)[0] + '_context.png'
+        cv2.imwrite(ctx_path, ctx8)
+        print(f"Kontext: {ctx_path} ({ctx_size}×{ctx_size}px, bester Frame #{best_idx})")
 
 
 # ══ CLI ═══════════════════════════════════════════════════════════════════════
@@ -283,8 +332,8 @@ Beispiele:
     )
     p.add_argument('input',  help='Eingabe: .avi oder .ser Datei')
     p.add_argument('output', help='Ausgabe: .png oder .tif (16-bit)')
-    p.add_argument('--top', type=float, default=10.0,
-                   metavar='PCT', help='Anteil bester Frames in %% (Standard: 10)')
+    p.add_argument('--top', type=float, default=25.0,
+                   metavar='PCT', help='Anteil bester Frames in %% (Standard: 25)')
     p.add_argument('--crop', type=int, default=300,
                    metavar='PX', help='Crop-Größe um Planet in Pixel (Standard: 300)')
     p.add_argument('--min_frames', type=int, default=50,
