@@ -172,61 +172,66 @@ def main():
         print(f"Optionen: top={args.top}%  crop={args.crop}px  "
               f"min_frames={args.min_frames}")
 
-        # ── Planet-Zentrum aus Mittelpunkt-Frame ──────────────────────────────
-        mid_arr = reader.read_frame(n // 2)
-        mid_bgr = debayer(mid_arr, bc)
-        cx, cy  = find_planet_center(mid_bgr, args.crop)
-        print(f"Planetenzentrum: ({cx}, {cy})")
+        # ── Pass 1: Per-Frame-Zentrumserkennung + Qualitäts-Ranking ─────────────
+        # Bei nicht-nachgeführten Aufnahmen driftet der Planet über den Frame.
+        # → Jeder Frame bekommt sein eigenes crop-Zentrum via Helligkeitsschwerpunkt.
+        print(f"\nPass 1: Zentrum-Tracking + Qualitäts-Ranking ({n} Frames)...")
+        scores  = np.zeros(n, dtype=np.float32)
+        centers = np.zeros((n, 2), dtype=np.int32)
 
-        # ── Pass 1: Qualitäts-Ranking (sequenziell) ───────────────────────────
-        print(f"\nPass 1: Qualitäts-Ranking ({n} Frames)...")
-        scores = np.zeros(n, dtype=np.float32)
         for i in range(n):
             arr = reader.read_frame(i)
             if arr is None:
                 continue
-            bgr     = debayer(arr, bc)
-            cropped = crop_around(bgr, cx, cy, args.crop)
-            scores[i] = sharpness(cropped)
+            bgr           = debayer(arr, bc)
+            cx, cy        = find_planet_center(bgr, args.crop)
+            centers[i]    = [cx, cy]
+            cropped        = crop_around(bgr, cx, cy, args.crop)
+            scores[i]     = sharpness(cropped)
             if (i + 1) % 500 == 0 or i == 0:
-                print(f"  {i+1}/{n}  (bisher bester Score: {scores[:i+1].max():.1f})",
-                      flush=True)
+                print(f"  {i+1}/{n}  pos=({cx},{cy})  "
+                      f"Score: {scores[:i+1].max():.1f}", flush=True)
 
         n_stack  = max(args.min_frames, int(n * args.top / 100.0))
         selected = np.argsort(scores)[::-1][:n_stack]
-        sel_sort = np.sort(selected)  # nach Index sortiert → sequenzielles Lesen
+        sel_sort = np.sort(selected)
         best_idx = int(selected[0])
         print(f"Ausgewählt: {n_stack} Frames (Top {args.top}%)"
               f"  Score-Bereich: {scores[selected].min():.1f}–{scores[selected].max():.1f}")
 
         # ── Referenz-Frame (schärfster Frame) ─────────────────────────────────
+        best_cx, best_cy = centers[best_idx]
         ref_bgr  = debayer(reader.read_frame(best_idx), bc)
-        ref_crop = crop_around(ref_bgr, cx, cy, args.crop)
+        ref_crop = crop_around(ref_bgr, best_cx, best_cy, args.crop)
         ref_gray = (0.299*ref_crop[:,:,2] + 0.587*ref_crop[:,:,1]
                     + 0.114*ref_crop[:,:,0])
 
-        # ── Pass 2: Alignen + Stacken (sequenziell über ausgewählte Frames) ───
+        # ── Pass 2: Alignen + Stacken ─────────────────────────────────────────
+        # Per-Frame-Zentrierung korrigiert den Drift; Phase Correlation
+        # korrigiert nur noch das verbleibende Seeing (wenige Pixel).
         print(f"\nPass 2: Stacking ({n_stack} Frames)...")
         sel_set  = set(sel_sort.tolist())
         acc      = np.zeros((args.crop, args.crop, 3), dtype=np.float64)
         w_total  = 0.0
         stacked  = 0
+        MAX_SEEING_PX = 20   # max. erwarteter Seeing-Shift nach Driftkorrektur
 
         for i in range(n):
             if i not in sel_set:
-                reader.read_frame(i)   # sequenziell vorwärts lesen (kein Seek)
+                reader.read_frame(i)
                 continue
-            arr  = reader.read_frame(i)
+            arr = reader.read_frame(i)
             if arr is None:
                 continue
-            bgr  = debayer(arr, bc)
-            crp  = crop_around(bgr, cx, cy, args.crop)
-            gray = (0.299*crp[:,:,2] + 0.587*crp[:,:,1] + 0.114*crp[:,:,0])
+            bgr        = debayer(arr, bc)
+            cx, cy     = centers[i]
+            crp        = crop_around(bgr, cx, cy, args.crop)
+            gray       = (0.299*crp[:,:,2] + 0.587*crp[:,:,1] + 0.114*crp[:,:,0])
 
             (dx, dy), _ = cv2.phaseCorrelate(ref_gray, gray)
 
-            # Plausibilitäts-Check: Shift nicht größer als halbe Crop-Größe
-            if abs(dx) > args.crop // 4 or abs(dy) > args.crop // 4:
+            # Nur verbleibende Seeing-Shifts akzeptieren
+            if abs(dx) > MAX_SEEING_PX or abs(dy) > MAX_SEEING_PX:
                 continue
 
             M       = np.float32([[1, 0, dx], [0, 1, dy]])
