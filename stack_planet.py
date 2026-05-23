@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""
+stack_planet.py – Planetarisches Lucky-Imaging-Stacking
+
+1. Qualitäts-Ranking aller Frames via Laplacian-Varianz (Schärfemaß)
+2. Top N% auswählen
+3. Auf besten Frame alignen (Phase Correlation, sub-pixel)
+4. Qualitätsgewichtetes Stacking
+5. 16-bit PNG oder TIFF ausgeben
+
+Usage:
+  stack_planet.py input.avi output.png [--top=10] [--crop=300]
+  stack_planet.py input.ser output.tif [--top=5] [--crop=400]
+"""
+
+import sys
+import os
+import struct
+import argparse
+import numpy as np
+import cv2
+
+WB_R = 1.05
+WB_B = 0.88
+
+BAYER_CODES = {
+    'RGGB': cv2.COLOR_BayerRG2BGR,
+    'GRBG': cv2.COLOR_BayerGR2BGR,
+    'GBRG': cv2.COLOR_BayerGB2BGR,
+    'BGGR': cv2.COLOR_BayerBG2BGR,
+}
+
+
+# ══ Format-Reader (analog ser2mp4.py) ═════════════════════════════════════════
+
+def _read_sharpcap_meta(path):
+    txt = path + '.txt'
+    if not os.path.exists(txt):
+        return {}
+    meta = {}
+    with open(txt, encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            if '=' in line:
+                k, _, v = line.partition('=')
+                meta[k.strip()] = v.strip()
+    return meta
+
+
+class SERReader:
+    def __init__(self, path):
+        self._f = open(path, 'rb')
+        self.info = self._parse_header()
+
+    def _parse_header(self):
+        hdr = self._f.read(178)
+        if len(hdr) < 178:
+            raise ValueError("SER-Header zu kurz")
+        color_id    = struct.unpack_from('<i', hdr, 18)[0]
+        width       = struct.unpack_from('<i', hdr, 26)[0]
+        height      = struct.unpack_from('<i', hdr, 30)[0]
+        bit_depth   = struct.unpack_from('<i', hdr, 34)[0]
+        frame_count = struct.unpack_from('<i', hdr, 38)[0]
+        ser_bayer   = {8: cv2.COLOR_BayerRG2BGR, 9: cv2.COLOR_BayerGR2BGR,
+                       10: cv2.COLOR_BayerGB2BGR, 11: cv2.COLOR_BayerBG2BGR}
+        return dict(width=width, height=height, bit_depth=bit_depth,
+                    frame_count=frame_count,
+                    bytes_per_pixel=(bit_depth + 7) // 8,
+                    bayer_code=ser_bayer.get(color_id),
+                    color_id=color_id, fmt='SER')
+
+    def read_frame(self, index):
+        bpp         = self.info['bytes_per_pixel']
+        frame_bytes = self.info['width'] * self.info['height'] * bpp
+        self._f.seek(178 + index * frame_bytes)
+        raw = self._f.read(frame_bytes)
+        if len(raw) < frame_bytes:
+            return None
+        return np.frombuffer(raw, dtype='<u2').reshape(
+            self.info['height'], self.info['width'])
+
+    def close(self): self._f.close()
+    def __enter__(self): return self
+    def __exit__(self, *_): self.close()
+
+
+class AVIReader:
+    def __init__(self, path):
+        meta       = _read_sharpcap_meta(path)
+        bayer_str  = meta.get('Debayer Type', 'RGGB')
+        self._cap  = cv2.VideoCapture(path)
+        if not self._cap.isOpened():
+            raise IOError(f"Kann AVI nicht öffnen: {path}")
+        w   = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h   = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        n   = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.info = dict(width=w, height=h, bit_depth=8, frame_count=n,
+                         bytes_per_pixel=1,
+                         bayer_code=BAYER_CODES.get(bayer_str, cv2.COLOR_BayerRG2BGR),
+                         color_id=bayer_str, fmt='AVI')
+        self._pos = -1
+
+    def read_frame(self, index):
+        if index != self._pos + 1:
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+        ret, frame = self._cap.read()
+        if not ret:
+            return None
+        self._pos = index
+        return frame[:, :, 0]  # pal8 → ein Kanal = Bayer-Wert
+
+    def close(self): self._cap.release()
+    def __enter__(self): return self
+    def __exit__(self, *_): self.close()
+
+
+def open_reader(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext == '.ser': return SERReader(path)
+    if ext == '.avi': return AVIReader(path)
+    raise ValueError(f"Unbekanntes Format: '{ext}' (erwartet .ser oder .avi)")
+
+
+# ══ Bildverarbeitung ══════════════════════════════════════════════════════════
+
+def debayer(arr, bayer_code):
+    """Bayer → BGR float32 mit WB-Korrektur."""
+    bgr   = cv2.cvtColor(arr, bayer_code)
+    bgr_f = bgr.astype(np.float32)
+    bgr_f[:, :, 2] *= WB_R
+    bgr_f[:, :, 0] *= WB_B
+    return bgr_f
+
+
+def find_planet_center(bgr_f, crop_size):
+    """Planetenzentrum via Helligkeitsschwerpunkt der Top-1%-Pixel."""
+    gray    = 0.299*bgr_f[:,:,2] + 0.587*bgr_f[:,:,1] + 0.114*bgr_f[:,:,0]
+    blurred = cv2.GaussianBlur(gray, (0, 0), 20)
+    thresh  = blurred >= np.percentile(blurred, 99.0)
+    ys, xs  = np.where(thresh)
+    h, w    = gray.shape
+    half    = crop_size // 2
+    if len(xs) == 0:
+        return w // 2, h // 2
+    cx = int(np.clip(np.mean(xs), half, w - half))
+    cy = int(np.clip(np.mean(ys), half, h - half))
+    return cx, cy
+
+
+def crop_around(bgr_f, cx, cy, size):
+    half = size // 2
+    return bgr_f[cy-half:cy+half, cx-half:cx+half]
+
+
+def sharpness(bgr_f):
+    """Laplacian-Varianz als Schärfemaß (höher = schärfer)."""
+    gray = 0.299*bgr_f[:,:,2] + 0.587*bgr_f[:,:,1] + 0.114*bgr_f[:,:,0]
+    return float(cv2.Laplacian(gray, cv2.CV_32F).var())
+
+
+# ══ Stacking ══════════════════════════════════════════════════════════════════
+
+def main():
+    args = parse_args()
+
+    with open_reader(args.input) as reader:
+        info = reader.info
+        n    = info['frame_count']
+        bc   = info['bayer_code']
+
+        print(f"{info['fmt']}: {info['width']}x{info['height']} {info['bit_depth']}bit "
+              f"| {n} Frames")
+        print(f"Optionen: top={args.top}%  crop={args.crop}px  "
+              f"min_frames={args.min_frames}")
+
+        # ── Planet-Zentrum aus Mittelpunkt-Frame ──────────────────────────────
+        mid_arr = reader.read_frame(n // 2)
+        mid_bgr = debayer(mid_arr, bc)
+        cx, cy  = find_planet_center(mid_bgr, args.crop)
+        print(f"Planetenzentrum: ({cx}, {cy})")
+
+        # ── Pass 1: Qualitäts-Ranking (sequenziell) ───────────────────────────
+        print(f"\nPass 1: Qualitäts-Ranking ({n} Frames)...")
+        scores = np.zeros(n, dtype=np.float32)
+        for i in range(n):
+            arr = reader.read_frame(i)
+            if arr is None:
+                continue
+            bgr     = debayer(arr, bc)
+            cropped = crop_around(bgr, cx, cy, args.crop)
+            scores[i] = sharpness(cropped)
+            if (i + 1) % 500 == 0 or i == 0:
+                print(f"  {i+1}/{n}  (bisher bester Score: {scores[:i+1].max():.1f})",
+                      flush=True)
+
+        n_stack  = max(args.min_frames, int(n * args.top / 100.0))
+        selected = np.argsort(scores)[::-1][:n_stack]
+        sel_sort = np.sort(selected)  # nach Index sortiert → sequenzielles Lesen
+        best_idx = int(selected[0])
+        print(f"Ausgewählt: {n_stack} Frames (Top {args.top}%)"
+              f"  Score-Bereich: {scores[selected].min():.1f}–{scores[selected].max():.1f}")
+
+        # ── Referenz-Frame (schärfster Frame) ─────────────────────────────────
+        ref_bgr  = debayer(reader.read_frame(best_idx), bc)
+        ref_crop = crop_around(ref_bgr, cx, cy, args.crop)
+        ref_gray = (0.299*ref_crop[:,:,2] + 0.587*ref_crop[:,:,1]
+                    + 0.114*ref_crop[:,:,0])
+
+        # ── Pass 2: Alignen + Stacken (sequenziell über ausgewählte Frames) ───
+        print(f"\nPass 2: Stacking ({n_stack} Frames)...")
+        sel_set  = set(sel_sort.tolist())
+        acc      = np.zeros((args.crop, args.crop, 3), dtype=np.float64)
+        w_total  = 0.0
+        stacked  = 0
+
+        for i in range(n):
+            if i not in sel_set:
+                reader.read_frame(i)   # sequenziell vorwärts lesen (kein Seek)
+                continue
+            arr  = reader.read_frame(i)
+            if arr is None:
+                continue
+            bgr  = debayer(arr, bc)
+            crp  = crop_around(bgr, cx, cy, args.crop)
+            gray = (0.299*crp[:,:,2] + 0.587*crp[:,:,1] + 0.114*crp[:,:,0])
+
+            (dx, dy), _ = cv2.phaseCorrelate(ref_gray, gray)
+
+            # Plausibilitäts-Check: Shift nicht größer als halbe Crop-Größe
+            if abs(dx) > args.crop // 4 or abs(dy) > args.crop // 4:
+                continue
+
+            M       = np.float32([[1, 0, dx], [0, 1, dy]])
+            aligned = cv2.warpAffine(crp, M, (args.crop, args.crop),
+                                     flags=cv2.INTER_LINEAR,
+                                     borderMode=cv2.BORDER_CONSTANT)
+
+            w        = float(scores[i])
+            acc     += aligned.astype(np.float64) * w
+            w_total += w
+            stacked += 1
+
+            if stacked % 100 == 0 or stacked == 1:
+                print(f"  {stacked}/{n_stack}...", flush=True)
+
+        if w_total == 0:
+            print("Fehler: Keine Frames gestackt.", file=sys.stderr)
+            sys.exit(1)
+
+        result_f = acc / w_total
+        print(f"\n{stacked} Frames gestackt (davon {n_stack - stacked} wegen"
+              f" Shift-Fehler verworfen)") if stacked < n_stack else \
+            print(f"\n{stacked} Frames gestackt.")
+
+        # ── Stretch auf 16-bit ────────────────────────────────────────────────
+        lo = np.percentile(result_f, 0.1)
+        hi = np.percentile(result_f, 99.9)
+        result16 = np.clip(
+            (result_f - lo) / (hi - lo + 1e-9) * 65535, 0, 65535
+        ).astype(np.uint16)
+
+        cv2.imwrite(args.output, result16)
+        size_kb = os.path.getsize(args.output) / 1024
+        print(f"Fertig: {args.output} ({size_kb:.0f} KB, 16-bit)")
+
+
+# ══ CLI ═══════════════════════════════════════════════════════════════════════
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description='Planetarisches Lucky-Imaging-Stacking',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Beispiele:
+  %(prog)s capture.avi jupiter.png
+  %(prog)s capture.avi jupiter.tif --top=5 --crop=400
+  %(prog)s capture.ser mond.png    --top=20 --crop=600
+        """,
+    )
+    p.add_argument('input',  help='Eingabe: .avi oder .ser Datei')
+    p.add_argument('output', help='Ausgabe: .png oder .tif (16-bit)')
+    p.add_argument('--top', type=float, default=10.0,
+                   metavar='PCT', help='Anteil bester Frames in %% (Standard: 10)')
+    p.add_argument('--crop', type=int, default=300,
+                   metavar='PX', help='Crop-Größe um Planet in Pixel (Standard: 300)')
+    p.add_argument('--min_frames', type=int, default=50,
+                   metavar='N', help='Mindestanzahl Frames unabhängig von --top (Standard: 50)')
+    return p.parse_args()
+
+
+if __name__ == '__main__':
+    main()
