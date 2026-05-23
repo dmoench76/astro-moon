@@ -1,12 +1,13 @@
 # astro-moon
 
-Python-Pipeline zur Verarbeitung planetarer Mondaufnahmen in abspielbare MP4-Videos.
+Python-Pipeline zur Verarbeitung planetarer Aufnahmen (Mond, Jupiter, ...) in abspielbare MP4-Videos.
+Unterstützt **SER RAW16** und **AVI RAW8** — Formaterkennung erfolgt automatisch anhand der Dateiendung.
 
 ## Was macht das Skript?
 
-Rohdaten einer Planetenkamera (SER RAW16, Bayer-Muster RGGB) werden in ein fertig prozessiertes,
+Rohdaten einer Planetenkamera (Bayer-Muster RGGB) werden in ein fertig prozessiertes,
 farbnormiertes MP4-Video umgewandelt. Die Pipeline adressiert dabei typische Probleme
-bei Lucky-Imaging-Aufnahmen des Mondes:
+bei Lucky-Imaging-Aufnahmen:
 
 - **Debayering** – Bayer-Rohdaten (RGGB) werden in Farb-BGR-Frames umgerechnet.
 - **Globale Streckung** – Helligkeit und Kontrast werden einmalig über Stichprobenframes
@@ -28,33 +29,53 @@ bei Lucky-Imaging-Aufnahmen des Mondes:
 
 ## Eingabe
 
-Das Skript erwartet **SER-Dateien** im Format RAW16 RGGB, wie sie SharpCap mit einer
-ZWO-Farbkamera erzeugt.
+Das Skript erkennt das Format automatisch an der Dateiendung und wählt den passenden Reader.
 
-**SER-Format-Besonderheit (SharpCap-Bug):**  
-SharpCap schreibt SER-Dateien immer little-endian, setzt aber `LittleEndian=0` im Header.
-Das Skript ignoriert dieses Flag und liest die Daten immer als `<u2` (little-endian 16-bit).
+### SER RAW16 (`.ser`)
 
-Getestet mit:
-- Kamera: **ZWO ASI662MC** (1920×1080, 16-bit, Farbsensor RGGB)
-- Software: **SharpCap** (SER-Aufnahme, RAW16-Modus)
-- Bayer-Code im SER-Header: ColorID=8 → `cv2.COLOR_BayerRG2BGR`
+SharpCap speichert 16-Bit-Bayer-Rohdaten im SER-Format (LUCAM-RECORDER).
+Jeder Frame wird direkt per Byte-Offset adressiert; Timestamps im Trailer
+ermöglichen präzises Timestamp-basiertes Frame-Mapping.
 
-Andere ZWO-Farbkameras mit RGGB-Sensor sollten ebenfalls funktionieren.
-Für andere Bayer-Muster (GRBG, GBRG, BGGR) sind die entsprechenden ColorIDs
-9, 10, 11 im Header bereits unterstützt.
+**SharpCap-Besonderheit:** SER-Dateien sind immer little-endian, unabhängig vom
+`LittleEndian`-Flag im Header. Das Skript ignoriert dieses Flag und liest
+grundsätzlich als `<u2`.
+
+Das Bayer-Muster wird aus dem ColorID-Feld im SER-Header bestimmt
+(ColorID 8–11 → RGGB, GRBG, GBRG, BGGR).
+
+### AVI RAW8 (`.avi`)
+
+SharpCap speichert 8-Bit-Bayer-Rohdaten als `pal8` (Palette-indexed) in AVI.
+Die Palette ist ein lineares Grau-Ramp; ein dekodierter Kanal ergibt den
+originalen Bayer-Wert. Frames werden per `cv2.VideoCapture` gelesen.
+
+Das Bayer-Muster und weitere Metadaten werden aus der SharpCap-Begleitdatei
+(`<datei>.avi.txt`) ausgelesen falls vorhanden; Fallback: RGGB.
+
+AVI-Dateien haben keine per-Frame-Timestamps; die Framerate wird
+als konstant angenommen (lineare Reihenfolge, keine Interpolation).
+
+### Getestet mit
+
+- Kamera: **ZWO ASI662MC** (1920×1080, Farbsensor RGGB)
+- Software: **SharpCap** (SER RAW16 und AVI RAW8)
+- Objekte: Mond (SER), Jupiter (AVI)
 
 ## Verwendung
 
 ```bash
-# Vollständiges Video (Standard: 48 fps, Farbpalette gold)
-python3 ser2mp4v5.py aufnahme.ser ausgabe.mp4
+# SER RAW16 (Mond)
+python3 ser2mp4.py aufnahme.ser ausgabe.mp4
+
+# AVI RAW8 (Jupiter, Mars, ...)
+python3 ser2mp4.py aufnahme.avi ausgabe.mp4 --color=pale
 
 # Optionen
-python3 ser2mp4v5.py aufnahme.ser ausgabe.mp4 --fps_out=60 --color=marsian
+python3 ser2mp4.py aufnahme.ser ausgabe.mp4 --fps_out=60 --color=marsian
 
 # Vorschau-Clip (3 Sekunden aus der Mitte, kein Rendering des gesamten Materials)
-python3 ser2mp4v5.py aufnahme.ser ausgabe.mp4 --sample_time=3s --sample_from=middle
+python3 ser2mp4.py aufnahme.ser ausgabe.mp4 --sample_time=3s --sample_from=middle
 ```
 
 ### Optionen
@@ -109,14 +130,3 @@ abweichende Pfade können direkt im Skript unter `VAAPI_DEV` angepasst werden.
 Auf reinen CPU-Systemen (kein DRI-Node) wird automatisch libx264 verwendet —
 ohne Konfigurationsänderung.
 
-## Skript-Versionshistorie
-
-| Version | Neuerung |
-|---------|----------|
-| v1 | Basis SER→MP4, little-endian-Fix, VAAPI/libx264-Fallback |
-| v2 | Globaler Stretch (kein Flicker), 48 fps |
-| v3 | Sky-Maske (echter schwarzer Hintergrund), CLAHE, feines USM (σ=1.5), Fade-in/out |
-| v4 | Timestamp-basiertes Frame-Mapping (gleichmäßige Mondbewegung) |
-| v5 | Phase-Correlation-Interpolation, Color-Grading-Presets, CLI-Optionen |
-
-`moon-in-the-river.py` ist das ursprüngliche Referenzskript für FITS-Dateien (astropy).

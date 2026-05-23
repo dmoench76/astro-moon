@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-ser2mp4v5.py – SER RAW16 RGGB → MP4, v5
+ser2mp4.py – SER RAW16 / AVI RAW8 RGGB → MP4
+
+Erkennt das Eingangsformat automatisch anhand der Dateiendung.
+SharpCap-Begleitdatei (.txt) wird ausgelesen wenn vorhanden (Bayer-Muster etc.).
 
 Usage:
-  ser2mp4v5.py input.ser output.mp4 [--fps_out=48] [--color=gold]
-  ser2mp4v5.py input.ser output.mp4 --sample_time=3s --sample_from=middle
+  ser2mp4.py input.ser output.mp4 [--fps_out=48] [--color=gold]
+  ser2mp4.py input.avi output.mp4 [--fps_out=48] [--color=gold]
+  ser2mp4.py input.ser output.mp4 --sample_time=3s --sample_from=middle
 """
 
 import sys
@@ -42,111 +46,173 @@ FADE_SECS     = 2.0
 SAMPLE_STEP   = 20
 ALPHA_MIN     = 0.02
 VAAPI_DEV     = '/dev/dri/renderD128'
+
+BAYER_CODES = {
+    'RGGB': cv2.COLOR_BayerRG2BGR,
+    'GRBG': cv2.COLOR_BayerGR2BGR,
+    'GBRG': cv2.COLOR_BayerGB2BGR,
+    'BGGR': cv2.COLOR_BayerBG2BGR,
+}
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def parse_args():
-    p = argparse.ArgumentParser(
-        description='SER RAW16 RGGB → MP4 Mondvideo-Pipeline',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Beispiele:
-  %(prog)s capture.ser output.mp4
-  %(prog)s capture.ser output.mp4 --fps_out=60 --color=marsian
-  %(prog)s capture.ser output.mp4 --sample_time=3s --sample_from=middle
-        """,
-    )
-    p.add_argument('ser_file', help='Eingabe: .ser Datei')
-    p.add_argument('output',   help='Ausgabe: .mp4 Datei')
-    p.add_argument('--fps_out', type=int, default=48,
-                   metavar='N', help='Ausgabe-Framerate (Standard: 48)')
-    p.add_argument('--color', choices=list(COLOR_PRESETS), default='gold',
-                   help='Farbpalette: pale, gold, marsian (Standard: gold)')
-    p.add_argument('--sample_time', default=None,
-                   metavar='DAUER', help='Vorschau-Dauer, z.B. 3s oder 500ms')
-    p.add_argument('--sample_from', choices=['start', 'middle', 'end'],
-                   default='middle', help='Vorschau-Position (Standard: middle)')
-    return p.parse_args()
+# ══ Format-Reader ═════════════════════════════════════════════════════════════
+
+class SERReader:
+    """Liest SER RAW16 RGGB-Dateien (SharpCap, LUCAM-RECORDER Format)."""
+
+    def __init__(self, path):
+        self._f = open(path, 'rb')
+        self.info = self._parse_header()
+
+    def _parse_header(self):
+        hdr = self._f.read(178)
+        if len(hdr) < 178:
+            raise ValueError("SER-Header zu kurz")
+        color_id    = struct.unpack_from('<i', hdr, 18)[0]
+        width       = struct.unpack_from('<i', hdr, 26)[0]
+        height      = struct.unpack_from('<i', hdr, 30)[0]
+        bit_depth   = struct.unpack_from('<i', hdr, 34)[0]
+        frame_count = struct.unpack_from('<i', hdr, 38)[0]
+        ser_bayer = {8: cv2.COLOR_BayerRG2BGR, 9: cv2.COLOR_BayerGR2BGR,
+                     10: cv2.COLOR_BayerGB2BGR, 11: cv2.COLOR_BayerBG2BGR}
+        return dict(
+            width=width, height=height, bit_depth=bit_depth,
+            frame_count=frame_count,
+            bytes_per_pixel=(bit_depth + 7) // 8,
+            bayer_code=ser_bayer.get(color_id),
+            color_id=color_id,
+            fmt='SER',
+        )
+
+    def read_frame(self, index):
+        bpp         = self.info['bytes_per_pixel']
+        frame_bytes = self.info['width'] * self.info['height'] * bpp
+        self._f.seek(178 + index * frame_bytes)
+        raw = self._f.read(frame_bytes)
+        if len(raw) < frame_bytes:
+            return None
+        # SharpCap schreibt immer little-endian, unabhängig vom Header-Flag
+        return np.frombuffer(raw, dtype='<u2').reshape(
+            self.info['height'], self.info['width'])
+
+    def read_timestamps(self):
+        bpp         = self.info['bytes_per_pixel']
+        frame_bytes = self.info['width'] * self.info['height'] * bpp
+        self._f.seek(178 + self.info['frame_count'] * frame_bytes)
+        ts_raw = self._f.read(self.info['frame_count'] * 8)
+        if len(ts_raw) < self.info['frame_count'] * 8:
+            return None
+        return np.frombuffer(ts_raw, dtype='<u8')
+
+    def close(self):
+        self._f.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
 
 
-def parse_duration(s):
-    """'3s' → 3.0,  '500ms' → 0.5"""
-    s = s.strip().lower()
-    if s.endswith('ms'):
-        return float(s[:-2]) / 1000.0
-    if s.endswith('s'):
-        return float(s[:-1])
-    return float(s)
+class AVIReader:
+    """
+    Liest AVI RAW8 RGGB-Dateien (SharpCap pal8-Format).
 
+    SharpCap speichert 8-Bit-Bayer-Rohdaten als pal8 (Palette-indexed) in AVI.
+    Die Palette ist ein lineares Grau-Ramp (Index i → BGR(i,i,i)).
+    cv2.VideoCapture dekodiert pal8 als BGR; ein Kanal genügt als Bayer-Array.
 
-def sample_output_path(output):
-    base, ext = os.path.splitext(output)
-    return f"{base}_sample{ext}"
+    AVI-Dateien haben keine per-Frame-Timestamps wie SER → lineare Reihenfolge.
+    """
 
+    def __init__(self, path):
+        meta           = _read_sharpcap_meta(path)
+        bayer_str      = meta.get('Debayer Type', 'RGGB')
+        self._bayer_str = bayer_str
 
-def parse_ser_header(f):
-    hdr = f.read(178)
-    if len(hdr) < 178:
-        raise ValueError("SER-Header zu kurz")
-    color_id    = struct.unpack_from('<i', hdr, 18)[0]
-    width       = struct.unpack_from('<i', hdr, 26)[0]
-    height      = struct.unpack_from('<i', hdr, 30)[0]
-    bit_depth   = struct.unpack_from('<i', hdr, 34)[0]
-    frame_count = struct.unpack_from('<i', hdr, 38)[0]
-    bayer_map = {8: cv2.COLOR_BayerRG2BGR, 9: cv2.COLOR_BayerGR2BGR,
-                 10: cv2.COLOR_BayerGB2BGR, 11: cv2.COLOR_BayerBG2BGR}
-    return dict(
-        width=width, height=height, bit_depth=bit_depth,
-        frame_count=frame_count,
-        bytes_per_pixel=(bit_depth + 7) // 8,
-        bayer_code=bayer_map.get(color_id),
-        color_id=color_id,
-    )
+        self._cap = cv2.VideoCapture(path)
+        if not self._cap.isOpened():
+            raise IOError(f"Kann AVI nicht öffnen: {path}")
 
+        w   = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h   = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        n   = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = self._cap.get(cv2.CAP_PROP_FPS)
 
-def read_timestamps(f, info):
-    frame_bytes = info['width'] * info['height'] * info['bytes_per_pixel']
-    f.seek(178 + info['frame_count'] * frame_bytes)
-    ts_raw = f.read(info['frame_count'] * 8)
-    if len(ts_raw) < info['frame_count'] * 8:
+        self.info = dict(
+            width=w, height=h, bit_depth=8,
+            frame_count=n,
+            bytes_per_pixel=1,
+            bayer_code=BAYER_CODES.get(bayer_str, cv2.COLOR_BayerRG2BGR),
+            color_id=bayer_str,
+            native_fps=fps,
+            fmt='AVI',
+        )
+        self._pos = -1
+
+    def read_frame(self, index):
+        if index != self._pos + 1:
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+        ret, frame = self._cap.read()
+        if not ret:
+            return None
+        self._pos = index
+        # pal8 → BGR(n,n,n): ein Kanal = originaler Bayer-Wert
+        return frame[:, :, 0]
+
+    def read_timestamps(self):
+        # AVI-Container hat keine per-Frame-Zeitstempel
         return None
-    return np.frombuffer(ts_raw, dtype='<u8')
+
+    def close(self):
+        self._cap.release()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
 
 
-def build_interpolation_map(ts, n_out):
-    targets = (ts[0] + np.arange(n_out, dtype=np.float64)
-               / max(n_out - 1, 1) * float(ts[-1] - ts[0]))
-    i_lo = (np.searchsorted(ts.astype(np.float64), targets, side='right') - 1
-            ).clip(0, len(ts) - 2)
-    i_hi = (i_lo + 1).clip(0, len(ts) - 1)
-    span = ts[i_hi].astype(np.float64) - ts[i_lo].astype(np.float64)
-    alpha = np.where(span > 0,
-                     (targets - ts[i_lo].astype(np.float64)) / (span + 1e-9),
-                     0.0).clip(0, 1)
-    return i_lo.astype(np.int32), i_hi.astype(np.int32), alpha
+def open_reader(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext == '.ser':
+        return SERReader(path)
+    if ext == '.avi':
+        return AVIReader(path)
+    raise ValueError(f"Unbekanntes Eingabeformat: '{ext}' (erwartet: .ser oder .avi)")
 
 
-def read_frame(f, info, index):
-    frame_bytes = info['width'] * info['height'] * info['bytes_per_pixel']
-    f.seek(178 + index * frame_bytes)
-    raw = f.read(frame_bytes)
-    if len(raw) < frame_bytes:
-        return None
-    return np.frombuffer(raw, dtype='<u2').reshape(info['height'], info['width'])
+def _read_sharpcap_meta(path):
+    """Liest SharpCap-Begleitdatei <datei>.txt falls vorhanden."""
+    txt = path + '.txt'
+    if not os.path.exists(txt):
+        return {}
+    meta = {}
+    with open(txt, encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            if '=' in line:
+                k, _, v = line.partition('=')
+                meta[k.strip()] = v.strip()
+    return meta
 
+
+# ══ Bildverarbeitung ══════════════════════════════════════════════════════════
 
 def debayer_wb(arr, bayer_code):
-    bgr16 = cv2.cvtColor(arr, bayer_code)
-    bgr_f = bgr16.astype(np.float32)
+    bgr   = cv2.cvtColor(arr, bayer_code)
+    bgr_f = bgr.astype(np.float32)
     bgr_f[:, :, 2] *= WB_R
     bgr_f[:, :, 0] *= WB_B
     return bgr_f
 
 
-def calibrate_stretch(f, info):
+def calibrate_stretch(reader):
+    info   = reader.info
     los, his = [], []
     for i in range(0, info['frame_count'], SAMPLE_STEP):
-        arr = read_frame(f, info, i)
+        arr = reader.read_frame(i)
         if arr is None:
             continue
         bgr_f = debayer_wb(arr, info['bayer_code'])
@@ -196,46 +262,52 @@ def process_frame(arr, bayer_code, lo, hi, grade):
     return bgr8
 
 
-def interpolate_frames(frame_a, frame_b, alpha, warp_maps_cache, pair_key):
-    if pair_key not in warp_maps_cache:
+def interpolate_frames(frame_a, frame_b, alpha, warp_cache, pair_key):
+    if pair_key not in warp_cache:
         ga = cv2.cvtColor(frame_a, cv2.COLOR_BGR2GRAY).astype(np.float32)
         gb = cv2.cvtColor(frame_b, cv2.COLOR_BGR2GRAY).astype(np.float32)
         (dx, dy), _ = cv2.phaseCorrelate(ga, gb)
         h, w = frame_a.shape[:2]
         cx = np.tile(np.arange(w, dtype=np.float32), (h, 1))
         cy = np.tile(np.arange(h, dtype=np.float32).reshape(h, 1), (1, w))
-        warp_maps_cache[pair_key] = (dx, dy, cx, cy)
-        if len(warp_maps_cache) > 4:
-            del warp_maps_cache[next(iter(warp_maps_cache))]
+        warp_cache[pair_key] = (dx, dy, cx, cy)
+        if len(warp_cache) > 4:
+            del warp_cache[next(iter(warp_cache))]
 
-    dx, dy, cx, cy = warp_maps_cache[pair_key]
-
+    dx, dy, cx, cy = warp_cache[pair_key]
     map_ax = cx + dx * alpha
     map_ay = cy + dy * alpha
     warped_a = cv2.remap(frame_a, map_ax, map_ay,
                          cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-
     map_bx = cx - dx * (1.0 - alpha)
     map_by = cy - dy * (1.0 - alpha)
     warped_b = cv2.remap(frame_b, map_bx, map_by,
                          cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-
     return cv2.addWeighted(warped_a, 1.0 - alpha, warped_b, alpha, 0)
 
 
+def build_interpolation_map(ts, n_out):
+    targets = (ts[0] + np.arange(n_out, dtype=np.float64)
+               / max(n_out - 1, 1) * float(ts[-1] - ts[0]))
+    i_lo = (np.searchsorted(ts.astype(np.float64), targets, side='right') - 1
+            ).clip(0, len(ts) - 2)
+    i_hi = (i_lo + 1).clip(0, len(ts) - 1)
+    span  = ts[i_hi].astype(np.float64) - ts[i_lo].astype(np.float64)
+    alpha = np.where(span > 0,
+                     (targets - ts[i_lo].astype(np.float64)) / (span + 1e-9),
+                     0.0).clip(0, 1)
+    return i_lo.astype(np.int32), i_hi.astype(np.int32), alpha
+
+
+# ══ Ausgabe ═══════════════════════════════════════════════════════════════════
+
 def build_ffmpeg_cmd(info, output, fps_out):
     use_vaapi = os.path.exists(VAAPI_DEV)
-    base = [
-        'ffmpeg', '-y',
-        '-f', 'rawvideo',
-        '-pixel_format', 'bgr24',
-        '-video_size', f'{info["width"]}x{info["height"]}',
-        '-framerate', str(fps_out),
-        '-i', 'pipe:0',
-    ]
+    base = ['ffmpeg', '-y', '-f', 'rawvideo', '-pixel_format', 'bgr24',
+            '-video_size', f'{info["width"]}x{info["height"]}',
+            '-framerate', str(fps_out), '-i', 'pipe:0']
     if use_vaapi:
-        enc = ['-vaapi_device', VAAPI_DEV,
-               '-vf', 'format=nv12,hwupload',
+        enc = ['-vaapi_device', VAAPI_DEV, '-vf', 'format=nv12,hwupload',
                '-c:v', 'h264_vaapi', '-qp', str(QP)]
         print(f"Encoder: h264_vaapi ({VAAPI_DEV})")
     else:
@@ -244,10 +316,11 @@ def build_ffmpeg_cmd(info, output, fps_out):
     return base + enc + ['-movflags', '+faststart', output]
 
 
-def render(f, info, i_lo_arr, i_hi_arr, alpha_arr, out_indices,
+def render(reader, i_lo_arr, i_hi_arr, alpha_arr, out_indices,
            output, fps_out, lo, hi, grade, fade):
-    cmd  = build_ffmpeg_cmd(info, output, fps_out)
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    info  = reader.info
+    cmd   = build_ffmpeg_cmd(info, output, fps_out)
+    proc  = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
     total       = len(out_indices)
     fade_frames = int(fps_out * FADE_SECS) if fade else 0
@@ -260,19 +333,18 @@ def render(f, info, i_lo_arr, i_hi_arr, alpha_arr, out_indices,
         alpha = float(alpha_arr[out_i])
 
         if i_lo not in frame_cache:
-            arr = read_frame(f, info, i_lo)
-            frame_cache[i_lo] = process_frame(arr, info['bayer_code'], lo, hi, grade)
+            frame_cache[i_lo] = process_frame(
+                reader.read_frame(i_lo), info['bayer_code'], lo, hi, grade)
         frame_lo = frame_cache[i_lo]
 
         if alpha < ALPHA_MIN or i_lo == i_hi:
             bgr8 = frame_lo
         else:
             if i_hi not in frame_cache:
-                arr = read_frame(f, info, i_hi)
-                frame_cache[i_hi] = process_frame(arr, info['bayer_code'], lo, hi, grade)
-            frame_hi = frame_cache[i_hi]
-            bgr8 = interpolate_frames(frame_lo, frame_hi, alpha,
-                                      warp_cache, (i_lo, i_hi))
+                frame_cache[i_hi] = process_frame(
+                    reader.read_frame(i_hi), info['bayer_code'], lo, hi, grade)
+            bgr8 = interpolate_frames(frame_lo, frame_cache[i_hi],
+                                      alpha, warp_cache, (i_lo, i_hi))
 
         if fade_frames:
             if seq_i < fade_frames:
@@ -293,23 +365,64 @@ def render(f, info, i_lo_arr, i_hi_arr, alpha_arr, out_indices,
     return proc.wait()
 
 
+# ══ CLI ═══════════════════════════════════════════════════════════════════════
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description='SER RAW16 / AVI RAW8 RGGB → MP4 Planetenvideo-Pipeline',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Beispiele:
+  %(prog)s capture.ser output.mp4
+  %(prog)s capture.avi output.mp4 --fps_out=60 --color=marsian
+  %(prog)s capture.ser output.mp4 --sample_time=3s --sample_from=middle
+        """,
+    )
+    p.add_argument('input',  help='Eingabe: .ser oder .avi Datei')
+    p.add_argument('output', help='Ausgabe: .mp4 Datei')
+    p.add_argument('--fps_out', type=int, default=48,
+                   metavar='N', help='Ausgabe-Framerate (Standard: 48)')
+    p.add_argument('--color', choices=list(COLOR_PRESETS), default='gold',
+                   help='Farbpalette: pale, gold, marsian (Standard: gold)')
+    p.add_argument('--sample_time', default=None,
+                   metavar='DAUER', help='Vorschau-Dauer, z.B. 3s oder 500ms')
+    p.add_argument('--sample_from', choices=['start', 'middle', 'end'],
+                   default='middle', help='Vorschau-Position (Standard: middle)')
+    return p.parse_args()
+
+
+def parse_duration(s):
+    s = s.strip().lower()
+    if s.endswith('ms'):
+        return float(s[:-2]) / 1000.0
+    if s.endswith('s'):
+        return float(s[:-1])
+    return float(s)
+
+
+def sample_output_path(output):
+    base, ext = os.path.splitext(output)
+    return f"{base}_sample{ext}"
+
+
 def main():
     args  = parse_args()
     grade = COLOR_PRESETS[args.color]
 
-    with open(args.ser_file, 'rb') as f:
-        info = parse_ser_header(f)
+    with open_reader(args.input) as reader:
+        info = reader.info
 
         if info['bayer_code'] is None:
-            print(f"Fehler: Unbekannter ColorID {info['color_id']}", file=sys.stderr)
+            print(f"Fehler: Unbekannter Bayer-Code '{info['color_id']}'", file=sys.stderr)
             sys.exit(1)
 
-        print(f"SER: {info['width']}x{info['height']} {info['bit_depth']}bit "
+        fmt_tag = info['fmt']
+        print(f"{fmt_tag}: {info['width']}x{info['height']} {info['bit_depth']}bit "
               f"| {info['frame_count']} Frames | → {args.output}")
         print(f"Optionen: fps_out={args.fps_out}  color={args.color} "
               f"[B×{grade[0]}  G×{grade[1]}  R×{grade[2]}]")
 
-        ts = read_timestamps(f, info)
+        ts = reader.read_timestamps()
         n  = info['frame_count']
         if ts is not None:
             duration_s = (ts[-1] - ts[0]) / 1e7
@@ -321,7 +434,7 @@ def main():
             i_hi_arr  = np.arange(n, dtype=np.int32)
             alpha_arr = np.zeros(n)
 
-        lo, hi = calibrate_stretch(f, info)
+        lo, hi = calibrate_stretch(reader)
 
         if args.sample_time:
             sample_s      = parse_duration(args.sample_time)
@@ -330,19 +443,18 @@ def main():
                 start = 0
             elif args.sample_from == 'end':
                 start = max(0, n - sample_frames)
-            else:  # middle
+            else:
                 start = max(0, (n - sample_frames) // 2)
             out_indices = list(range(start, min(n, start + sample_frames)))
             out_path    = sample_output_path(args.output)
             print(f"Vorschau: {len(out_indices)} Frames ab Index {start} "
                   f"(≈{len(out_indices)/args.fps_out:.1f} s) → {out_path}")
-            ret = render(f, info, i_lo_arr, i_hi_arr, alpha_arr,
+            ret = render(reader, i_lo_arr, i_hi_arr, alpha_arr,
                          out_indices, out_path, args.fps_out, lo, hi, grade, fade=False)
         else:
             out_path    = args.output
-            out_indices = list(range(n))
-            ret = render(f, info, i_lo_arr, i_hi_arr, alpha_arr,
-                         out_indices, out_path, args.fps_out, lo, hi, grade, fade=True)
+            ret = render(reader, i_lo_arr, i_hi_arr, alpha_arr,
+                         list(range(n)), out_path, args.fps_out, lo, hi, grade, fade=True)
 
     if ret == 0:
         size_mb = os.path.getsize(out_path) / 1024**2
