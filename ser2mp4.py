@@ -26,21 +26,35 @@ COLOR_PRESETS = {
     'marsian': (0.42, 0.98, 1.22),   # orange-rot, klar sichtbar
 }
 
+# ── Ziel-Presets (Stretch + Sky-Mask) ─────────────────────────────────────────
+# moon:   Objekt füllt ~80% des Frames → niedrige Percentile greifen ins Objekt
+# planet: Objekt füllt ~1% des Frames  → hohe Percentile nötig, sonst nur Himmel
+TARGET_PRESETS = {
+    'moon': dict(
+        stretch_lo = 15.0,
+        stretch_hi = 97.0,
+        sky_t_lo   = 0.10,
+        sky_t_hi   = 0.22,
+    ),
+    'planet': dict(
+        stretch_lo = 99.0,
+        stretch_hi = 99.9,
+        sky_t_lo   = 0.03,
+        sky_t_hi   = 0.12,
+    ),
+}
+
 # ── Konstante Konfiguration ───────────────────────────────────────────────────
 QP            = 20
 FLIP_VERT     = True
 WB_R          = 1.05
 WB_B          = 0.88
-STRETCH_LO    = 15.0
-STRETCH_HI    = 97.0
 GAMMA         = 0.75
 BRIGHT        = 0.6
 CLAHE_LIMIT   = 2.0
 CLAHE_GRID    = (8, 8)
 SHARP_AMT     = 1.5
 SHARP_SIGMA   = 1.5
-SKY_T_LO      = 0.10
-SKY_T_HI      = 0.22
 SKY_BLUR_SIG  = 15
 FADE_SECS     = 2.0
 SAMPLE_STEP   = 20
@@ -208,8 +222,8 @@ def debayer_wb(arr, bayer_code):
     return bgr_f
 
 
-def calibrate_stretch(reader):
-    info   = reader.info
+def calibrate_stretch(reader, stretch_lo, stretch_hi):
+    info     = reader.info
     los, his = [], []
     for i in range(0, info['frame_count'], SAMPLE_STEP):
         arr = reader.read_frame(i)
@@ -217,21 +231,21 @@ def calibrate_stretch(reader):
             continue
         bgr_f = debayer_wb(arr, info['bayer_code'])
         lum = 0.299*bgr_f[:,:,2] + 0.587*bgr_f[:,:,1] + 0.114*bgr_f[:,:,0]
-        los.append(np.percentile(lum, STRETCH_LO))
-        his.append(np.percentile(lum, STRETCH_HI))
+        los.append(np.percentile(lum, stretch_lo))
+        his.append(np.percentile(lum, stretch_hi))
     lo, hi = float(np.median(los)), float(np.median(his))
-    print(f"Stretch: lo={lo:.0f}  hi={hi:.0f}  ({len(los)} Stichproben)")
+    print(f"Stretch: lo={lo:.1f}  hi={hi:.1f}  ({len(los)} Stichproben)")
     return lo, hi
 
 
-def process_frame(arr, bayer_code, lo, hi, grade):
+def process_frame(arr, bayer_code, lo, hi, grade, sky_t_lo, sky_t_hi):
     grade_b, grade_g, grade_r = grade
 
     bgr_f = debayer_wb(arr, bayer_code)
     bgr_n = np.clip((bgr_f - lo) / (hi - lo + 1e-6), 0, 1)
 
     lum_raw  = 0.299*bgr_n[:,:,2] + 0.587*bgr_n[:,:,1] + 0.114*bgr_n[:,:,0]
-    sky_mask = np.clip((lum_raw - SKY_T_LO) / (SKY_T_HI - SKY_T_LO), 0, 1).astype(np.float32)
+    sky_mask = np.clip((lum_raw - sky_t_lo) / (sky_t_hi - sky_t_lo + 1e-6), 0, 1).astype(np.float32)
     sky_mask = cv2.GaussianBlur(sky_mask, (0, 0), SKY_BLUR_SIG)
 
     bgr8 = (bgr_n ** GAMMA * 255).astype(np.uint8)
@@ -317,7 +331,7 @@ def build_ffmpeg_cmd(info, output, fps_out):
 
 
 def render(reader, i_lo_arr, i_hi_arr, alpha_arr, out_indices,
-           output, fps_out, lo, hi, grade, fade):
+           output, fps_out, lo, hi, grade, sky_t_lo, sky_t_hi, fade):
     info  = reader.info
     cmd   = build_ffmpeg_cmd(info, output, fps_out)
     proc  = subprocess.Popen(cmd, stdin=subprocess.PIPE)
@@ -334,7 +348,7 @@ def render(reader, i_lo_arr, i_hi_arr, alpha_arr, out_indices,
 
         if i_lo not in frame_cache:
             frame_cache[i_lo] = process_frame(
-                reader.read_frame(i_lo), info['bayer_code'], lo, hi, grade)
+                reader.read_frame(i_lo), info['bayer_code'], lo, hi, grade, sky_t_lo, sky_t_hi)
         frame_lo = frame_cache[i_lo]
 
         if alpha < ALPHA_MIN or i_lo == i_hi:
@@ -342,7 +356,7 @@ def render(reader, i_lo_arr, i_hi_arr, alpha_arr, out_indices,
         else:
             if i_hi not in frame_cache:
                 frame_cache[i_hi] = process_frame(
-                    reader.read_frame(i_hi), info['bayer_code'], lo, hi, grade)
+                    reader.read_frame(i_hi), info['bayer_code'], lo, hi, grade, sky_t_lo, sky_t_hi)
             bgr8 = interpolate_frames(frame_lo, frame_cache[i_hi],
                                       alpha, warp_cache, (i_lo, i_hi))
 
@@ -374,8 +388,9 @@ def parse_args():
         epilog="""
 Beispiele:
   %(prog)s capture.ser output.mp4
-  %(prog)s capture.avi output.mp4 --fps_out=60 --color=marsian
+  %(prog)s capture.avi output.mp4 --target=planet --color=pale
   %(prog)s capture.ser output.mp4 --sample_time=3s --sample_from=middle
+  %(prog)s capture.avi output.mp4 --target=planet --stretch_hi=99.95
         """,
     )
     p.add_argument('input',  help='Eingabe: .ser oder .avi Datei')
@@ -384,6 +399,16 @@ Beispiele:
                    metavar='N', help='Ausgabe-Framerate (Standard: 48)')
     p.add_argument('--color', choices=list(COLOR_PRESETS), default='gold',
                    help='Farbpalette: pale, gold, marsian (Standard: gold)')
+    p.add_argument('--target', choices=list(TARGET_PRESETS), default='moon',
+                   help='Ziel-Preset für Stretch und Sky-Mask: moon, planet (Standard: moon)')
+    p.add_argument('--stretch_lo', type=float, default=None,
+                   metavar='PCT', help='Stretch unteres Percentil (überschreibt --target)')
+    p.add_argument('--stretch_hi', type=float, default=None,
+                   metavar='PCT', help='Stretch oberes Percentil (überschreibt --target)')
+    p.add_argument('--sky_t_lo', type=float, default=None,
+                   metavar='V', help='Sky-Mask unterer Schwellenwert (überschreibt --target)')
+    p.add_argument('--sky_t_hi', type=float, default=None,
+                   metavar='V', help='Sky-Mask oberer Schwellenwert (überschreibt --target)')
     p.add_argument('--sample_time', default=None,
                    metavar='DAUER', help='Vorschau-Dauer, z.B. 3s oder 500ms')
     p.add_argument('--sample_from', choices=['start', 'middle', 'end'],
@@ -406,8 +431,15 @@ def sample_output_path(output):
 
 
 def main():
-    args  = parse_args()
-    grade = COLOR_PRESETS[args.color]
+    args    = parse_args()
+    grade   = COLOR_PRESETS[args.color]
+    preset  = TARGET_PRESETS[args.target]
+
+    # CLI-Overrides überschreiben Preset-Werte
+    stretch_lo = args.stretch_lo if args.stretch_lo is not None else preset['stretch_lo']
+    stretch_hi = args.stretch_hi if args.stretch_hi is not None else preset['stretch_hi']
+    sky_t_lo   = args.sky_t_lo   if args.sky_t_lo   is not None else preset['sky_t_lo']
+    sky_t_hi   = args.sky_t_hi   if args.sky_t_hi   is not None else preset['sky_t_hi']
 
     with open_reader(args.input) as reader:
         info = reader.info
@@ -416,11 +448,12 @@ def main():
             print(f"Fehler: Unbekannter Bayer-Code '{info['color_id']}'", file=sys.stderr)
             sys.exit(1)
 
-        fmt_tag = info['fmt']
-        print(f"{fmt_tag}: {info['width']}x{info['height']} {info['bit_depth']}bit "
+        print(f"{info['fmt']}: {info['width']}x{info['height']} {info['bit_depth']}bit "
               f"| {info['frame_count']} Frames | → {args.output}")
-        print(f"Optionen: fps_out={args.fps_out}  color={args.color} "
+        print(f"Optionen: fps_out={args.fps_out}  target={args.target}  color={args.color} "
               f"[B×{grade[0]}  G×{grade[1]}  R×{grade[2]}]")
+        print(f"Stretch: {stretch_lo}%/{stretch_hi}%  "
+              f"Sky-Mask: {sky_t_lo}/{sky_t_hi}")
 
         ts = reader.read_timestamps()
         n  = info['frame_count']
@@ -434,7 +467,7 @@ def main():
             i_hi_arr  = np.arange(n, dtype=np.int32)
             alpha_arr = np.zeros(n)
 
-        lo, hi = calibrate_stretch(reader)
+        lo, hi = calibrate_stretch(reader, stretch_lo, stretch_hi)
 
         if args.sample_time:
             sample_s      = parse_duration(args.sample_time)
@@ -450,11 +483,13 @@ def main():
             print(f"Vorschau: {len(out_indices)} Frames ab Index {start} "
                   f"(≈{len(out_indices)/args.fps_out:.1f} s) → {out_path}")
             ret = render(reader, i_lo_arr, i_hi_arr, alpha_arr,
-                         out_indices, out_path, args.fps_out, lo, hi, grade, fade=False)
+                         out_indices, out_path, args.fps_out, lo, hi,
+                         grade, sky_t_lo, sky_t_hi, fade=False)
         else:
-            out_path    = args.output
+            out_path = args.output
             ret = render(reader, i_lo_arr, i_hi_arr, alpha_arr,
-                         list(range(n)), out_path, args.fps_out, lo, hi, grade, fade=True)
+                         list(range(n)), out_path, args.fps_out, lo, hi,
+                         grade, sky_t_lo, sky_t_hi, fade=True)
 
     if ret == 0:
         size_mb = os.path.getsize(out_path) / 1024**2
